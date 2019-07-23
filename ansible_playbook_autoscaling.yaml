@@ -1,0 +1,281 @@
+--- 
+
+- hosts: localhost
+  vars:
+    mgmt_port_name: "Mgmt-port"
+    lan1_port_name: "Lan-1"
+    mgmt_subnet_name: "Subnet-Mgmt"
+    lan1_subnet_name: "Subnet-External"
+    nios_provider:
+      host: 10.196.200.108
+      username: admin
+      password: infoblox
+      wapi_version: 2.7
+  connection: local  
+  tasks:
+  - name: Create Mgmt Port  
+    os_port:
+         auth:
+           auth_url: "{{ lookup('ini', 'auth_url section=auth_url file=value.ini') }}"
+           password: "{{ lookup('ini', 'password section=auth_url file=value.ini') }}"
+           project_name: "{{ lookup('ini', 'project_name section=auth_url file=value.ini') }}"
+           username: "{{ lookup('ini', 'username section=auth_url file=value.ini') }}"
+         name: "{{ mgmt_port_name }}"
+         network: "{{ lookup('ini', 'mgmt_network section=networks file=value.ini') }}"
+         security_groups: "{{ lookup('ini', 'security_groups section=security_groups file=value.ini') }}"
+         state: present
+    register: name
+     
+  - name: Create Lan-1 Port
+    os_port:
+         auth:
+           auth_url: "{{ lookup('ini', 'auth_url section=auth_url file=value.ini') }}"
+           password: "{{ lookup('ini', 'password section=auth_url file=value.ini') }}"
+           project_name: "{{ lookup('ini', 'project_name section=auth_url file=value.ini') }}"
+           username: "{{ lookup('ini', 'username section=auth_url file=value.ini') }}"
+         name: "{{ lan1_port_name }}"
+         network: "{{ lookup('ini', 'lan1_network section=networks file=value.ini') }}"
+         security_groups: "{{ lookup('ini', 'security_groups section=security_groups file=value.ini') }}" 
+         state: present
+    register: name
+  
+  - name: Deploy vNIOS Member on OpenStack
+    os_server:
+       name: "{{ lookup('ini', 'name section=openstack_member_name file=value.ini') }}"
+       state: present
+       image: "{{ lookup('ini', 'image section=image file=value.ini') }}"
+       timeout: 200
+       flavor: "{{ lookup('ini', 'flavor section=flavor file=value.ini') }}"
+       nics: "port-name={{ mgmt_port_name }},port-name={{ lan1_port_name }}" 
+       config_drive: yes
+       user_data: |
+        # infoblox-config
+         remote_console_enabled: y
+         temp_license: nios IB-V825 dns dhcp enterprise
+         default_admin_password: infoblox
+  
+   
+  - os_port_facts:
+       auth:
+         auth_url: "{{ lookup('ini', 'auth_url section=auth_url file=value.ini') }}"
+         password: "{{ lookup('ini', 'password section=auth_url file=value.ini') }}"
+         project_name: "{{ lookup('ini', 'project_name section=auth_url file=value.ini') }}"
+         username: "{{ lookup('ini', 'username section=auth_url file=value.ini') }}"
+
+  - name: Get the port IP address
+    set_fact:
+       ip: "{{ item.fixed_ips[0].ip_address }}"
+    when: item.name == "{{ lan1_port_name }}"
+    with_items:
+        - "{{ openstack_ports }}"
+    register: ip
+## Waiting for 4 minutes for member to comeonline. Please increaese this incase to ~ 7-10 minutes incase you are usig SATA drives and not SSDs 
+  - pause:
+        minutes: 4
+   
+  - name: Checking https status
+    command: curl --head --insecure https://"{{ip}}"
+    register: result
+    until: result.stdout.find("302 Found")!=1
+    retries: 1000
+    delay: 5
+    changed_when: false
+
+  - os_subnets_facts:
+
+  - name: Get the port subnet cidr
+    set_fact:
+         subnet: "{{ item.cidr }}"
+    when: item.name == "{{ lan1_subnet_name }}"
+    with_items:
+        - "{{ openstack_subnets }}"
+    register: subnet
+
+  - name: Get the port subnet gateway
+    set_fact:
+         gateway_ip: "{{ item.gateway_ip }}"
+    when: item.name == "{{ lan1_subnet_name }}"
+    with_items:
+        - "{{ openstack_subnets }}"
+    register: gateway_ip
+
+  
+  - name: Pre-provision vNIOS in the Grid-Master
+    nios_member:
+       host_name: "{{ lookup('ini', 'name section=host_name file=value.ini') }}"
+       vip_setting:
+        - subnet_mask: "{{ subnet | ipaddr('netmask') }}"
+          gateway: "{{gateway_ip}}"
+          address: "{{ip}}"
+       config_addr_type: IPV4
+       platform: VNIOS
+       comment: Created with Ansible
+       state: present
+       provider: "{{ nios_provider }}"
+
+  - name: Adding member to the Grid
+    uri:
+      url: "https://{{ip}}/wapi/v2.7/grid?_function=join&_return_as_object=1"
+      method: POST
+      user: "{{ lookup('ini', 'user section=grid_user file=value.ini') }}"
+      password:  "{{ lookup('ini', 'password section=grid_password file=value.ini') }}"
+      status_code: 201,302,200
+      method: POST
+      header:
+         Content-Type: "application/json"
+      body:
+        grid_name: "{{ lookup('ini', 'grid_name section=grid_name file=value.ini') }}"
+        shared_secret: "{{ lookup('ini', 'shared_secret section=shared_secret file=value.ini') }}"
+        master: "{{ lookup('ini', 'gm_internal_ip section=gm_internal_ip file=value.ini') }}"
+      body_format: json
+      validate_certs: no
+      return_content: yes
+
+##  Waiting for 3 minutes for member to comeonline after grid join .Please increase the duration to ~ 7-10 minutes incase you are usig SATA drives and not SSDs.
+  - pause: 
+      minutes: 3
+
+  - name: Checking DNS service status 
+    uri:
+       url: "https://{{ lookup('ini', 'gm_ip section=gm_ip file=value.ini') }}/wapi/v2.7/member:dns?_return_fields=enable_dns"
+       method: GET
+       user: "{{ lookup('ini', 'user section=grid_user file=value.ini') }}"
+       password: "{{ lookup('ini', 'password section=grid_password file=value.ini') }}"
+       status_code: 201, 302, 200
+       header:
+          Content-Type: "application/json"  
+       validate_certs: no
+       return_content: yes
+    register: dnsdata
+  
+
+  - name: Starting DNS Service
+    uri:
+       url: "https://{{ lookup('ini', 'gm_ip section=gm_ip file=value.ini') }}/wapi/v2.7/{{ dnsdata.json[3]._ref }}?_return_as_object=1"
+       method: PUT
+       user: "{{ lookup('ini', 'user section=grid_user file=value.ini') }}"
+       password: "{{ lookup('ini', 'password section=grid_password file=value.ini') }}"
+       status_code: 201, 302, 200
+       header:
+         Content-type: "application/json"
+       body:
+         enable_dns: true
+       body_format: json
+       validate_certs: no
+       return_content: yes
+    register: dns_status
+  
+  - name: Get the nameserver group ref ID
+    uri: 
+       url: "https://{{ lookup('ini', 'gm_ip section=gm_ip file=value.ini') }}/wapi/v2.10/nsgroup?_return_as_object=1" 
+       method: GET
+       user: admin
+       password: infoblox
+       status_code: 201, 302, 200
+       validate_certs: no
+       return_content: yes
+    register: data
+
+## Greping the nameserver group ref id.
+
+  - name: Echo the nameserver group ID
+    shell: echo "{{ data.json.result[0]._ref }}" | cut -d":" -f1 | cut -d"/" -f2
+    register: ref_data
+  
+  - name: Add the deployed vNIOS member to the name server group
+    uri:
+       url: "https://{{ lookup('ini', 'gm_ip section=gm_ip file=value.ini') }}/wapi/v2.10/nsgroup/{{ ref_data.stdout }}"
+       method: PUT
+       user: admin
+       password: infoblox
+       status_code: 201, 302, 200
+       header:
+         Content-Type: "application/json"
+       body:
+        grid_primary:
+           - name: "{{ lookup('ini', 'name section=host_name file=value.ini') }}"
+           - name: "{{ lookup('ini', 'member02 section=existing_members file=value.ini') }}"
+           - name: "{{ lookup('ini', 'member01 section=existing_members file=value.ini') }}"
+       body_format: json
+       validate_certs: no
+       return_content: yes
+  
+  - name: Checking anycast configuration 
+    uri:
+       url: "https://{{ lookup('ini', 'gm_ip section=gm_ip file=value.ini') }}/wapi/v2.7/member?_return_as_object=1"
+       method: GET
+       user: "{{ lookup('ini', 'user section=grid_user file=value.ini') }}"
+       password: "{{ lookup('ini', 'password section=grid_password file=value.ini') }}"
+       status_code: 201, 302, 200
+       header:
+         Content-Type: "application/json"
+       validate_certs: no
+       return_content: yes
+    register: restdata
+
+
+  - name: Configuring Anycast 
+    uri:
+       url: "https://{{ lookup('ini', 'gm_ip section=gm_ip file=value.ini') }}/wapi/v2.7/{{ restdata.json['result'][3]._ref}}?_return_as_object=1"     
+       method: PUT
+       user: "{{ lookup('ini', 'user section=grid_user file=value.ini') }}"
+       password: "{{ lookup('ini', 'password section=grid_password file=value.ini') }}"
+       status_code: 201, 200, 302
+       header:
+         Content-Type: "application/json"
+       body:
+         additional_ip_list:
+                  - anycast: true       
+                    enable_bgp: true
+                    interface: "{{ lookup('ini', 'anycast_interface section=anycast file=value.ini') }}"
+                    ipv4_network_setting:
+                             subnet_mask: "{{ lookup('ini', 'subnet_mask section=anycast file=value.ini') }}"
+                             address: "{{ lookup('ini', 'address section=anycast file=value.ini') }}"
+                             gateway: "{{ lookup('ini', 'gateway section=anycast file=value.ini') }}"
+         bgp_as: 
+           - as: 65530
+             link_detect: true
+             neighbors:
+               - authentication_mode: "{{ lookup('ini', 'authentication_mode section=anycast file=value.ini') }}"
+                 interface: "{{ lookup('ini', 'interface section=anycast file=value.ini') }}"
+                 neighbor_ip: "{{ lookup('ini', 'neighbor_ip section=anycast file=value.ini') }}"
+                 remote_as: 65530
+                 enable_bfd: true
+       body_format: json          
+       validate_certs: no
+       return_content: yes
+    register: restdata
+       
+
+...
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
