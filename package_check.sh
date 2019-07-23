@@ -1,4 +1,4 @@
-!/bin/bash
+#!/bin/bash
 
 
 echo "Please wait while we setup and update the apt-repo for you"
